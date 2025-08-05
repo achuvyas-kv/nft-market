@@ -1,0 +1,17 @@
+{
+  "name": "hardhat-project",
+  "scripts": {
+    "deploy:upgradeable": "npx hardhat run scripts/deploy-upgradeable.ts --network localhost",
+    "deploy:upgradeable:testnet": "npx hardhat run scripts/deploy-upgradeable.ts --network sepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@openzeppelin/hardhat-upgrades": "^3.9.1",
+    "hardhat": "^2.26.1"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "@openzeppelin/contracts-upgradeable": "^5.4.0",
+    "pinata": "^2.4.9"
+  }
+}
