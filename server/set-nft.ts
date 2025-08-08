@@ -37,3 +37,25 @@ updateNFTAddress();
 
 // const nftAddress = await purchaseContract?.nft();
 // console.log("NFT contract is set to:", nftAddress);
+
+// huvyas@ll-kv-achu:~/Developer/nft-marketmaster $ npx hardhat ignition deploy ignition/modules/ResaleLight.ts --network sepolia
+// ✔ Confirm deploy to network sepolia (11155111)? … yes
+// Hardhat Ignition 🚀
+
+// Resuming existing deployment from ./ignition/deployments/chain-11155111
+
+// Deploying [ ResaleLightModuleV1 ]
+
+// Warning - previously executed futures are not in the module:
+//  - LightNFTModuleV6#LightNFT
+
+// Batch #1
+//   Executed ResaleLightModuleV1#ResaleLight
+
+// [ ResaleLightModuleV1 ] successfully deployed 🚀
+
+// Deployed Addresses
+
+// LightNFTModuleV6#LightNFT - 0x6dbAE469973657930d7d9688b71305775DBBbC6f
+// ResaleLightModuleV1#ResaleLight - 0xE0Dc1C80f8F56A0B55169627379887f12f01b610
+// achuvyas@ll-kv-achu:~/Developer/nft-marketmaster $
