@@ -27,6 +27,11 @@ interface IERC1271 {
     ) external view returns (bytes4);
 }
 
+interface ISafe {
+    function getOwners() external view returns (address[] memory);
+    function getThreshold() external view returns (uint256);
+}
+
 contract CrownPurchase is Ownable, EIP712 {
     using ECDSA for bytes32;
 
@@ -38,7 +43,7 @@ contract CrownPurchase is Ownable, EIP712 {
     // EIP712 domain separator for marketplace transfers
     bytes32 private constant TRANSFER_TYPEHASH =
         keccak256(
-            "Transfer(address from,address to,uint256 tokenId,uint256 price,uint256 deadline,uint256 nonce)"
+            "Transfer(address from,uint256 tokenId,uint256 price,uint256 deadline,uint256 nonce)"
         );
 
     // Nonces for each address to prevent replay attacks
@@ -59,6 +64,19 @@ contract CrownPurchase is Ownable, EIP712 {
         uint256 indexed tokenId,
         uint256 price
     );
+
+    // Debug events for signature verification
+    event SignatureInputs(
+        address from,
+        address to,
+        uint256 tokenId,
+        uint256 price,
+        uint256 deadline,
+        uint256 nonce
+    );
+    event SignatureEip1271Checked(address tokenOwner, bytes4 result, bool validated);
+    event SignatureFallbackChecked(address tokenOwner, address recoveredSigner, uint256 threshold, bool isOwner, bool validated);
+    event SignatureEoaChecked(address tokenOwner, address recoveredSigner);
 
     constructor(
         address _darkToken,
@@ -157,12 +175,13 @@ contract CrownPurchase is Ownable, EIP712 {
         require(crownNFT.ownerOf(tokenId) == from, "Not token owner");
         require(to != address(0), "Invalid recipient");
 
+        emit SignatureInputs(from, to, tokenId, price, deadline, nonce);
+
         // Verify EIP712 signature
         bytes32 structHash = keccak256(
             abi.encode(
                 TRANSFER_TYPEHASH,
                 from,
-                to,
                 tokenId,
                 price,
                 deadline,
@@ -174,15 +193,70 @@ contract CrownPurchase is Ownable, EIP712 {
         address tokenOwner = crownNFT.ownerOf(tokenId);
 
         if (tokenOwner.code.length > 0) {
-            // Token owner is a smart contract, use EIP-1271
-            require(
-                IERC1271(tokenOwner).isValidSignature(hash, signature) ==
-                    0x1626ba7e,
-                "Invalid smart wallet signature"
-            );
+            // Token owner is a smart contract, try EIP-1271 via low-level staticcall
+            bool validated = false;
+            bytes4 eip1271Result = 0x00000000;
+
+            {
+                (bool ok, bytes memory ret) = tokenOwner.staticcall(
+                    abi.encodeWithSelector(IERC1271.isValidSignature.selector, hash, signature)
+                );
+                if (ok && ret.length >= 4) {
+                    eip1271Result = bytes4(ret);
+                    validated = (eip1271Result == 0x1626ba7e);
+                }
+                emit SignatureEip1271Checked(tokenOwner, eip1271Result, validated);
+            }
+
+            if (!validated) {
+                // Fallback: accept EOA owner signature when Safe threshold == 1 and signer is an owner
+                address recoveredSigner = hash.recover(signature);
+
+                uint256 threshold = 0;
+                bool gotThreshold = false;
+                {
+                    (bool okT, bytes memory retT) = tokenOwner.staticcall(
+                        abi.encodeWithSelector(ISafe.getThreshold.selector)
+                    );
+                    if (okT && retT.length >= 32) {
+                        threshold = abi.decode(retT, (uint256));
+                        gotThreshold = true;
+                    }
+                }
+
+                if (!gotThreshold || threshold != 1) {
+                    emit SignatureFallbackChecked(tokenOwner, recoveredSigner, threshold, false, false);
+                    revert("Invalid smart wallet signature");
+                }
+
+                bool isOwner = false;
+                {
+                    (bool okO, bytes memory retO) = tokenOwner.staticcall(
+                        abi.encodeWithSelector(ISafe.getOwners.selector)
+                    );
+                    if (okO) {
+                        address[] memory owners = abi.decode(retO, (address[]));
+                        for (uint256 i = 0; i < owners.length; i++) {
+                            if (owners[i] == recoveredSigner) {
+                                isOwner = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!isOwner) {
+                    emit SignatureFallbackChecked(tokenOwner, recoveredSigner, threshold, false, false);
+                    revert("Invalid smart wallet signature");
+                }
+
+                validated = true;
+                emit SignatureFallbackChecked(tokenOwner, recoveredSigner, threshold, true, validated);
+            }
         } else {
             // Token owner is an EOA, use standard signature verification
             address signer = hash.recover(signature);
+            emit SignatureEoaChecked(tokenOwner, signer);
             require(signer == tokenOwner, "Invalid signature");
         }
 
@@ -192,15 +266,15 @@ contract CrownPurchase is Ownable, EIP712 {
         // Transfer DARK tokens from buyer to seller
         if (price > 0) {
             require(
-                darkToken.balanceOf(msg.sender) >= price,
+                darkToken.balanceOf(to) >= price,
                 "Insufficient DARK token balance"
             );
             require(
-                darkToken.allowance(msg.sender, address(this)) >= price,
+                darkToken.allowance(to, address(this)) >= price,
                 "Insufficient DARK token allowance"
             );
             require(
-                darkToken.transferFrom(msg.sender, from, price),
+                darkToken.transferFrom(to, from, price),
                 "DARK token transfer failed"
             );
         }
@@ -234,7 +308,6 @@ contract CrownPurchase is Ownable, EIP712 {
             abi.encode(
                 TRANSFER_TYPEHASH,
                 from,
-                to,
                 tokenId,
                 price,
                 deadline,

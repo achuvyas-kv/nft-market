@@ -1,18 +1,9 @@
 {
-  "LightNFTModuleV6#LightNFT": "0x6dbAE469973657930d7d9688b71305775DBBbC6f",
-  "ResaleLightModuleV1#ResaleLight": "0xE0Dc1C80f8F56A0B55169627379887f12f01b610",
-  "CompleteMarketplaceV1#LightNFT": "0xc6f5284D51fd7c92d81D3B3B066216Ee7E99E5fB",
-  "CompleteMarketplaceV1#ResaleLight": "0xdE377cD4085F56104655bF15636c295723db86f8",
-  "StarToken#StarToken": "0x5a8974CD95aa79D6bac9E5Eb71fEb5e98ed0168f",
-  "CrownNFTModule#CrownNFT": "0xd609A93f5F0807037db9Fca878122940a0f2F6E6",
-  "DarkTokenModule#DarkToken": "0x9740D146D20FCF8643274cCD4Db91210200c9ed4",
-  "CrownNFTModule#CrownNFTSimple": "0x6E751200c5e007De65C8b0a926F1C3A25081e7a6",
-  "CrownPurchaseModule#CrownPurchase": "0x131FA2aB317A7dD41c3C50024080A822551549c0",
-  "CrownNFTV2Module#CrownNFTSimple": "0x3Ec6a7B37f1142A5607E2299Ea00358dDEa864ab",
-  "CrownMarketplaceV3#CrownNFTSimple": "0xcdFfE0168029d7C1562196Bcbb8A65b2021AA0A2",
-  "CrownMarketplaceV3#CrownPurchase": "0x086B19bad4D944d1C39cCF0F5f2a66067187408C",
-  "CrownMarketplaceV4#CrownNFTSimple": "0x72E97ea1352C62177614bb3bDa484fb3138959EB",
-  "CrownMarketplaceV4#CrownPurchase": "0x0E774A82B49846c246A3a0220637542ddCBf83Fa",
-  "CrownMarketplaceV5#CrownNFTSimple": "0x602158126D46767D1e0B7eA91F246a1dbE06C71D",
-  "CrownMarketplaceV5#CrownPurchase": "0x7836C0BD3A34Fc03415CCA04937f8c5E8c915FA3"
+  "CrownMarketplaceV6#CrownNFTSimple": "0xFdc2bC2554A80eFb353809A90b9F69e666341D6f",
+  "DarkTokenModule#DarkToken": "0x4d4C324C3a408476e25887025dDbA50839ECd7B1",
+  "CrownMarketplaceV6#CrownPurchase": "0xbB65150bfAaA2d23e04A6d3f0fae0b48F795f64b",
+  "CrownMarketplaceV7#CrownNFTSimple": "0x42D04a0237c0b46269499b878ed97E1b32b92B85",
+  "CrownMarketplaceV7#CrownPurchase": "0xB4780943E64B3f8Fe5aA6cfD55bf8e9de7ab66d1",
+  "CrownMarketplaceV8#CrownNFTSimple": "0x65B3b1064C04e2E54A055ccf0a3F5e4077B4fBf6",
+  "CrownMarketplaceV8#CrownPurchase": "0xB7Aa678187441466e11B2EFCF6a9716AC7Bb840c"
 }

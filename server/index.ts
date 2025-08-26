@@ -1,13 +1,16 @@
 import { createClient } from "@libsql/client";
 import { serve } from "bun";
 import { ethers } from "ethers";
+import { collapseTextChangeRangesAcrossMultipleVersions } from "typescript";
+import { handleGenerateSignature } from "./generate-counter-signature";
 
-const INFURA_URL = "https://sepolia.infura.io/v3/62fe7ded81c349f2a237483f8becd2e2";
+const RPC_HTTP_URL = process.env.RPC_HTTP_URL || "https://eth-sepolia.g.alchemy.com/v2/nqF678YEpSD8Wj-hm0pwN";
+const RPC_WS_URL = process.env.RPC_WS_URL || "wss://eth-sepolia.g.alchemy.com/v2/nqF678YEpSD8Wj-hm0pwN";
 
 // Crown NFT Contract Addresses (Updated to V5 - Fixed Signature Verification)
-const CROWN_NFT_ADDRESS = "0x602158126D46767D1e0B7eA91F246a1dbE06C71D"; // New V5 Clean NFT Contract
-const CROWN_PURCHASE_ADDRESS = "0x7836C0BD3A34Fc03415CCA04937f8c5E8c915FA3"; // New V5 Marketplace Contract (Fixed)
-const DARK_TOKEN_ADDRESS = "0x9740D146D20FCF8643274cCD4Db91210200c9ed4";
+const CROWN_NFT_ADDRESS = "0x65B3b1064C04e2E54A055ccf0a3F5e4077B4fBf6"; // V8 CrownNFTSimple
+const CROWN_PURCHASE_ADDRESS = "0xB7Aa678187441466e11B2EFCF6a9716AC7Bb840c"; // V8 CrownPurchase (buyer-agnostic EIP-712)
+const DARK_TOKEN_ADDRESS = "0x4d4C324C3a408476e25887025dDbA50839ECd7B1"; // Deployed DarkToken
 
 const CONTRACT_ABI = [
 	"event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
@@ -16,6 +19,7 @@ const CONTRACT_ABI = [
 const PURCHASE_CONTRACT_ABI = [
 	"event NFTPurchased(address indexed buyer, uint256 indexed tokenId, uint256 price)",
 	"event PriceUpdated(uint256 oldPrice, uint256 newPrice)",
+	"event MarketplaceTransfer(address indexed from, address indexed to, uint256 indexed tokenId, uint256 price)",
 	"function getNFTPrice() view returns (uint256)",
 	"function nonces(address owner) view returns (uint256)"
 ];
@@ -25,9 +29,86 @@ const client = createClient({
 	url: "libsql://nft-test-achuvyas-kv.aws-ap-south-1.turso.io",
 });
 
-const provider = new ethers.JsonRpcProvider(INFURA_URL);
+const provider = new ethers.JsonRpcProvider(RPC_HTTP_URL, { name: "sepolia", chainId: 11155111 });
+// Slow down polling to reduce RPC load / rate-limit issues
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(provider as any).pollingInterval = 30000;
 const contract = new ethers.Contract(CROWN_NFT_ADDRESS, CONTRACT_ABI, provider);
 const purchaseContract = new ethers.Contract(CROWN_PURCHASE_ADDRESS, PURCHASE_CONTRACT_ABI, provider);
+
+// For event subscriptions (kept disabled), prefer WebSocket provider (set RPC_WS_URL env):
+// const wsProvider = new ethers.WebSocketProvider(RPC_WS_URL, { name: "sepolia", chainId: 11155111 });
+// const wsContract = new ethers.Contract(CROWN_NFT_ADDRESS, CONTRACT_ABI, wsProvider);
+// const wsPurchaseContract = new ethers.Contract(CROWN_PURCHASE_ADDRESS, PURCHASE_CONTRACT_ABI, wsProvider);
+
+// Limit how far back we sync to reduce RPC load
+const SYNC_LOOKBACK_BLOCKS = 200_000; // ~ look back range; adjust as needed
+// Provider block range cap for eth_getLogs (Alchemy public: 500). Use 450 to be safe.
+const LOGS_MAX_BLOCK_RANGE = Number(process.env.LOGS_MAX_BLOCK_RANGE || 450);
+
+// Utility: sleep
+function sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Utility: detect Infura rate-limit error
+function isRateLimitError(err: any): boolean {
+	console.log(err)
+    try {
+        if (!err) return false;
+        const msg = String(err.message || err.shortMessage || "");
+        if (msg.toLowerCase().includes("too many requests")) return true;
+        if (err.code === "BAD_DATA") {
+            const value = err.value || [];
+            if (Array.isArray(value)) {
+                return value.some((v) => v && (v.code === -32005 || String(v.message || "").toLowerCase().includes("too many requests")));
+            }
+        }
+    } catch {}
+    return false;
+}
+
+// Utility: execute with exponential backoff on rate-limit
+async function withBackoff<T>(fn: () => Promise<T>, maxAttempts = 5, baseDelayMs = 1000): Promise<T> {
+    let attempt = 0;
+    let delay = baseDelayMs;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (isRateLimitError(err) && attempt < maxAttempts) {
+                attempt++;
+                console.warn(`RPC rate-limited; retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})`);
+                await sleep(delay);
+                delay *= 2;
+                continue;
+            }
+            throw err;
+        }
+    }
+}
+
+// Utility: query events in chunks to avoid getLogs over-large ranges
+async function queryFilterChunked(
+    ctr: ethers.Contract,
+    eventName: string,
+    fromBlock: number,
+    toBlock: number,
+    chunkSize = LOGS_MAX_BLOCK_RANGE
+) {
+    const events: ethers.EventLog[] = [];
+    let start = fromBlock;
+    while (start <= toBlock) {
+        const end = Math.min(start + chunkSize - 1, toBlock);
+        const res = await withBackoff(() => ctr.queryFilter(eventName, start, end));
+        events.push(...(res as ethers.EventLog[]));
+        start = end + 1;
+        // small pacing delay to be nice to the RPC
+        await sleep(200);
+    }
+    return events;
+}
 
 // Database schema
 const schema = `
@@ -56,6 +137,8 @@ CREATE TABLE IF NOT EXISTS listings (
   signature TEXT NOT NULL,
   deadline INTEGER NOT NULL,
   nonce INTEGER NOT NULL,
+  signer_address TEXT,
+  is_safe_wallet BOOLEAN DEFAULT FALSE,
   is_active BOOLEAN DEFAULT TRUE,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -181,14 +264,35 @@ purchaseContract.on("NFTPurchased", async (buyer, tokenId, price, event) => {
 	}
 });
 
+// Listen for marketplace resale transfers to deactivate listings
+// purchaseContract.on("MarketplaceTransfer", async (from, to, tokenId, price, event) => {
+//     console.log("🔄 MarketplaceTransfer Event:");
+//     console.log("From:", from);
+//     console.log("To:", to);
+//     console.log("Token ID:", tokenId.toString());
+//     console.log("Price:", ethers.formatUnits(price, 18), "DARK");
+//
+//     try {
+//         // Deactivate any active listing for this tokenId and seller
+//         const res = await client.execute({
+//             sql: `UPDATE listings SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE token_id = ? AND contract_address = ? AND seller_address = ? AND is_active = 1`,
+//             args: [tokenId.toString(), CROWN_NFT_ADDRESS, from]
+//         });
+//         console.log(`✅ Deactivated ${res.rowsAffected} listing(s) for token ${tokenId} from ${from}`);
+//     } catch (e) {
+//         console.error("❌ Error deactivating listing on MarketplaceTransfer:", e);
+//     }
+// });
+
 // Sync past transfers function
 async function syncPastTransfers() {
 	console.log("🔄 Syncing past transfers...");
-	const fromBlock = 0;
-	const toBlock = "latest";
+	const latest = await withBackoff(() => provider.getBlockNumber());
+	const fromBlock = Math.max(0, Number(latest) - SYNC_LOOKBACK_BLOCKS);
+	console.log(`Querying Transfer events from block ${fromBlock} to ${latest}`);
 
 	try {
-		const events = await contract.queryFilter("Transfer", fromBlock, toBlock);
+		const events = await queryFilterChunked(contract, "Transfer", fromBlock, latest);
 		console.log(`Found ${events.length} Transfer events`);
 
 		for (const event of events) {
@@ -232,11 +336,12 @@ async function syncPastTransfers() {
 // Sync past NFTPurchased events function
 async function syncPastPurchases() {
 	console.log("🔄 Syncing past NFTPurchased events...");
-	const fromBlock = 0;
-	const toBlock = "latest";
+	const latest = await withBackoff(() => provider.getBlockNumber());
+	const fromBlock = Math.max(0, Number(latest) - SYNC_LOOKBACK_BLOCKS);
+	console.log(`Querying NFTPurchased events from block ${fromBlock} to ${latest}`);
 
 	try {
-		const events = await purchaseContract.queryFilter("NFTPurchased", fromBlock, toBlock);
+		const events = await queryFilterChunked(purchaseContract, "NFTPurchased", fromBlock, latest);
 		console.log(`Found ${events.length} NFTPurchased events`);
 
 		for (const event of events) {
@@ -275,6 +380,36 @@ async function syncPastPurchases() {
 		console.error("❌ Purchase sync failed:", error);
 		throw error;
 	}
+}
+
+// Sync past MarketplaceTransfer events to deactivate any lingering listings
+async function syncPastMarketplaceTransfers() {
+    console.log("🔄 Syncing past MarketplaceTransfer events...");
+    const latest = await withBackoff(() => provider.getBlockNumber());
+    const fromBlock = Math.max(0, Number(latest) - SYNC_LOOKBACK_BLOCKS);
+    console.log(`Querying MarketplaceTransfer events from block ${fromBlock} to ${latest}`);
+
+    try {
+        const events = await queryFilterChunked(purchaseContract, "MarketplaceTransfer", fromBlock, latest);
+        console.log(`Found ${events.length} MarketplaceTransfer events`);
+
+        for (const event of events) {
+            const eventLog = event as ethers.EventLog;
+            if (!eventLog.args) continue;
+            const { from, to, tokenId, price } = eventLog.args as any;
+
+            await client.execute({
+                sql: `UPDATE listings SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE token_id = ? AND contract_address = ? AND seller_address = ? AND is_active = 1`,
+                args: [tokenId.toString(), CROWN_NFT_ADDRESS, from]
+            });
+        }
+
+        console.log(`✅ Synced ${events.length} MarketplaceTransfer events`);
+        return { success: true, eventsProcessed: events.length };
+    } catch (error) {
+        console.error("❌ MarketplaceTransfer sync failed:", error);
+        throw error;
+    }
 }
 
 // CORS headers
@@ -405,7 +540,7 @@ serve({
 		if (url.pathname === "/create-listing" && req.method === "POST") {
 			try {
 				const body = await req.json() as any;
-				const { tokenId, contractAddress, sellerAddress, price, signature, deadline, nonce } = body;
+				const { tokenId, contractAddress, sellerAddress, price, signature, deadline, nonce, signerAddress, isSafeWallet } = body;
 				
 				// Validate required fields
 				if (!tokenId || !contractAddress || !sellerAddress || !price || !signature || !deadline || nonce === undefined) {
@@ -450,41 +585,51 @@ serve({
 					);
 				}
 
-				// Verify the seller's signature for listing authorization
+				// Verify the seller's transfer signature
 				try {
 					const { ethers } = await import("ethers");
 					
 					const domain = {
-						name: "CrownMarketplace",
+						name: "CrownPurchase",
 						version: "1",
 						chainId: 11155111, // Sepolia
 						verifyingContract: CROWN_PURCHASE_ADDRESS
 					};
 
 					const types = {
-						ListingAuthorization: [
-							{ name: "seller", type: "address" },
+						Transfer: [
+							{ name: "from", type: "address" },
 							{ name: "tokenId", type: "uint256" },
 							{ name: "price", type: "uint256" },
-							{ name: "deadline", type: "uint256" }
+							{ name: "deadline", type: "uint256" },
+							{ name: "nonce", type: "uint256" }
 						]
 					};
 
 					const message = {
-						seller: sellerAddress,
+						from: sellerAddress,
 						tokenId: parseInt(tokenId),
 						price: price,
-						deadline: deadline
+						deadline: deadline,
+						nonce: nonce
 					};
 
-					console.log("Verifying signature with:", { domain, types, message, signature, expectedSigner: sellerAddress });
-					
 					const recoveredAddress = ethers.verifyTypedData(domain, types, message, signature);
-					console.log("Recovered address:", recoveredAddress, "Expected:", sellerAddress);
+					console.log("Recovered signer:", recoveredAddress);
 					
-					if (recoveredAddress.toLowerCase() !== sellerAddress.toLowerCase()) {
+					// Accept EOA owner signatures when NFT owner is a Safe wallet
+					let expectedSigner = sellerAddress;
+					if (isSafeWallet && signerAddress) {
+						expectedSigner = signerAddress;
+						console.log("Safe listing: accepting EOA owner signature from:", expectedSigner);
+					}
+					
+					if (recoveredAddress.toLowerCase() !== expectedSigner.toLowerCase()) {
 						return new Response(
-							JSON.stringify({ error: "Invalid seller signature" }),
+							JSON.stringify({ 
+								error: "Invalid seller signature", 
+								details: `Expected signature from ${expectedSigner}, got ${recoveredAddress}`
+							}),
 							{ 
 								status: 403, 
 								headers: { ...corsHeaders, "Content-Type": "application/json" }
@@ -492,11 +637,11 @@ serve({
 						);
 					}
 					
-					console.log(`✅ Verified listing authorization signature from ${sellerAddress}`);
+					console.log("✅ Transfer signature verified successfully");
 				} catch (err) {
-					console.error("Signature verification failed:", err);
+					console.error("Transfer signature verification failed:", err);
 					return new Response(
-						JSON.stringify({ error: "Invalid signature format" }),
+						JSON.stringify({ error: "Invalid transfer signature" }),
 						{ 
 							status: 400, 
 							headers: { ...corsHeaders, "Content-Type": "application/json" }
@@ -504,14 +649,14 @@ serve({
 					);
 				}
 
-				// Store listing in database with user's authorization signature
+				// Store listing in database with transfer signature
 				await client.execute({
 					sql: `
 						INSERT OR REPLACE INTO listings 
-						(token_id, contract_address, seller_address, price, signature, deadline, nonce, is_active, updated_at) 
-						VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+						(token_id, contract_address, seller_address, price, signature, deadline, nonce, signer_address, is_safe_wallet, is_active, updated_at) 
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
 					`,
-					args: [tokenId.toString(), contractAddress, sellerAddress, price, signature, deadline, nonce]
+					args: [tokenId.toString(), contractAddress, sellerAddress, price, signature, deadline, nonce, signerAddress ?? null, isSafeWallet ? 1 : 0]
 				});
 
 				console.log(`✅ NFT #${tokenId} listed for sale by ${sellerAddress} at ${ethers.formatUnits(price, 18)} DARK`);
@@ -552,7 +697,7 @@ serve({
 		if (url.pathname === "/get-listing-signature" && req.method === "POST") {
 			try {
 				const body = await req.json() as any;
-				const { tokenId, contractAddress, buyerAddress } = body;
+				const { tokenId, contractAddress, buyerAddress, sellerAddress } = body;
 				
 				if (!tokenId || !contractAddress || !buyerAddress) {
 					return new Response(
@@ -571,14 +716,28 @@ serve({
 				// Ensure tokenId is treated as string for database consistency
 				const tokenIdStr = tokenId.toString();
 				
-				const listingResult = await client.execute({
-					sql: `
-						SELECT * FROM listings 
-						WHERE token_id = ? AND contract_address = ? AND is_active = 1 AND deadline > ?
-						ORDER BY created_at DESC LIMIT 1
-					`,
-					args: [tokenIdStr, contractAddress, currentTimestamp]
-				});
+				// Build query to find listing - if sellerAddress is provided, use it to find the specific listing
+				let listingResult;
+				if (sellerAddress) {
+					listingResult = await client.execute({
+						sql: `
+							SELECT * FROM listings 
+							WHERE token_id = ? AND contract_address = ? AND seller_address = ? AND is_active = 1 AND deadline > ?
+							ORDER BY created_at DESC LIMIT 1
+						`,
+						args: [tokenIdStr, contractAddress, sellerAddress, currentTimestamp]
+					});
+				} else {
+					listingResult = await client.execute({
+						sql: `
+							SELECT * FROM listings 
+							WHERE token_id = ? AND contract_address = ? AND is_active = 1 AND deadline > ?
+							ORDER BY created_at DESC LIMIT 1
+						`,
+						args: [tokenIdStr, contractAddress, currentTimestamp]
+					});
+				}
+				console.log(listingResult)
 
 				if (listingResult.rows.length === 0) {
 					return new Response(
@@ -591,105 +750,20 @@ serve({
 				}
 
 				const listing = listingResult.rows[0] as any;
-
-				// Verify the stored listing authorization signature is still valid
-				try {
-					const domain = {
-						name: "CrownMarketplace",
-						version: "1",
-						chainId: 11155111, // Sepolia
-						verifyingContract: CROWN_PURCHASE_ADDRESS
-					};
-
-					const types = {
-						ListingAuthorization: [
-							{ name: "seller", type: "address" },
-							{ name: "tokenId", type: "uint256" },
-							{ name: "price", type: "uint256" },
-							{ name: "deadline", type: "uint256" }
-						]
-					};
-
-					const message = {
-						seller: listing.seller_address,
-						tokenId: parseInt(listing.token_id),
-						price: listing.price,
-						deadline: listing.deadline
-					};
-
-					const recoveredAddress = ethers.verifyTypedData(domain, types, message, listing.signature);
-					
-					if (recoveredAddress.toLowerCase() !== listing.seller_address.toLowerCase()) {
-						return new Response(
-							JSON.stringify({ error: "Invalid listing authorization" }),
-							{ 
-								status: 403, 
-								headers: { ...corsHeaders, "Content-Type": "application/json" }
-							}
-						);
-					}
-					
-					console.log(`✅ Verified listing authorization for purchase`);
-				} catch (err) {
-					console.error("Listing authorization verification failed:", err);
-					return new Response(
-						JSON.stringify({ error: "Invalid listing authorization signature" }),
-						{ 
-							status: 400, 
-							headers: { ...corsHeaders, "Content-Type": "application/json" }
-						}
-					);
-				}
-
-				// Check if seller still owns the NFT on the blockchain
-				const nftContract = new ethers.Contract(contractAddress, [
-					"function ownerOf(uint256 tokenId) view returns (address)"
-				], provider);
-				
-				const currentOwner = await nftContract.ownerOf!(parseInt(listing.token_id));
-				console.log(`Current NFT owner on blockchain: ${currentOwner}`);
-				console.log(`Seller in listing: ${listing.seller_address}`);
-				
-				if (currentOwner.toLowerCase() !== listing.seller_address.toLowerCase()) {
-					return new Response(
-						JSON.stringify({ error: `NFT is no longer owned by the seller. Current owner: ${currentOwner}` }),
-						{ 
-							status: 400, 
-							headers: { ...corsHeaders, "Content-Type": "application/json" }
-						}
-					);
-				}
-				
-				// Get current nonce from the blockchain (not the stored one)
-				const currentNonce = await purchaseContract.getFunction("nonces")(listing.seller_address);
-				console.log(`Current nonce for seller ${listing.seller_address}: ${currentNonce}, stored nonce: ${listing.nonce}`);
-				
-				// Generate transfer signature with the buyer address using admin key
-				const { generateTransferSignature } = await import("./generate-eip712-signature.js");
-				
+				// Immediately return stored signature and transfer data
 				const transferData = {
 					from: listing.seller_address,
 					to: buyerAddress,
 					tokenId: parseInt(listing.token_id),
 					price: listing.price,
 					deadline: listing.deadline,
-					nonce: Number(currentNonce)  // Use current nonce from blockchain
+					nonce: Number(listing.nonce)
 				};
-
-				const signature = await generateTransferSignature(transferData);
-
+				console.log("✅ Returning stored signature for listing", { tokenId: listing.token_id, seller: listing.seller_address });
 				return new Response(
-					JSON.stringify({
-						success: true,
-						signature,
-						transferData,
-						timestamp: Math.floor(Date.now() / 1000)
-					}),
-					{ 
-						headers: { ...corsHeaders, "Content-Type": "application/json" }
-					}
+					JSON.stringify({ success: true, signature: listing.signature, transferData, timestamp: Math.floor(Date.now() / 1000) }),
+					{ headers: { ...corsHeaders, "Content-Type": "application/json" } }
 				);
-				
 			} catch (error) {
 				console.error("❌ Get listing signature failed:", error);
 				return new Response(
@@ -838,19 +912,138 @@ serve({
 			}
 		}
 
+		// Apply a purchase by reading the MarketplaceTransfer event from a tx hash
+		if (url.pathname === "/apply-purchase" && req.method === "POST") {
+			try {
+				const body = await req.json() as any;
+				const { txHash } = body;
+				if (!txHash || typeof txHash !== "string") {
+					return new Response(JSON.stringify({ error: "Missing or invalid txHash" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+				}
+
+				// Fetch receipt
+				const receipt = await withBackoff(() => provider.getTransactionReceipt(txHash));
+				if (!receipt) {
+					return new Response(JSON.stringify({ error: "Transaction receipt not found" }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+				}
+
+				// Parse logs for MarketplaceTransfer
+				const iface = new ethers.Interface(PURCHASE_CONTRACT_ABI);
+				let parsed: { from: string; to: string; tokenId: bigint; price: bigint } | null = null;
+				for (const log of receipt.logs || []) {
+					if (!log.address || log.address.toLowerCase() !== CROWN_PURCHASE_ADDRESS.toLowerCase()) continue;
+					try {
+						const pl = iface.parseLog({ topics: log.topics as string[], data: log.data as string });
+						if (pl && pl.name === "MarketplaceTransfer") {
+							const { from, to, tokenId, price } = pl.args as any;
+							parsed = { from, to, tokenId: BigInt(tokenId), price: BigInt(price) };
+							break;
+						}
+					} catch {}
+				}
+
+				if (!parsed) {
+					return new Response(JSON.stringify({ error: "MarketplaceTransfer event not found in tx" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+				}
+
+				const tokenIdStr = parsed.tokenId.toString();
+				const newOwner = parsed.to;
+				const oldOwner = parsed.from;
+
+				// Ensure new owner exists
+				await client.execute({ sql: "INSERT OR IGNORE INTO owners (address) VALUES (?)", args: [newOwner] });
+				const ownerRow = await client.execute({ sql: "SELECT id FROM owners WHERE address = ?", args: [newOwner] });
+				const newOwnerId = ownerRow.rows?.[0]?.id;
+				if (!newOwnerId) {
+					return new Response(JSON.stringify({ error: "Failed to resolve new owner in DB" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+				}
+
+				// Upsert NFT and set owner
+				await client.execute({
+					sql: `INSERT INTO nfts (token_id, contract_address, owner_id)
+					      VALUES (?, ?, ?)
+					      ON CONFLICT(token_id) DO UPDATE SET owner_id = excluded.owner_id`,
+					args: [tokenIdStr, CROWN_NFT_ADDRESS, newOwnerId]
+				});
+
+				// Deactivate listing by old owner if present
+				await client.execute({
+					sql: `UPDATE listings SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+					      WHERE token_id = ? AND contract_address = ? AND seller_address = ? AND is_active = 1`,
+					args: [tokenIdStr, CROWN_NFT_ADDRESS, oldOwner]
+				});
+
+				return new Response(JSON.stringify({
+					success: true,
+					applied: {
+						tokenId: tokenIdStr,
+						from: oldOwner,
+						to: newOwner,
+						price: parsed.price.toString(),
+						txHash
+					}
+				}), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+			} catch (error) {
+				console.error("❌ Apply purchase failed:", error);
+				return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+			}
+		}
+
+		// Generate counter signature endpoint
+		if (url.pathname === "/generate-counter-signature" && req.method === "POST") {
+			return new Promise((resolve) => {
+				const mockRes = {
+					status: (code: number) => ({
+						json: (data: any) => {
+							resolve(new Response(JSON.stringify(data), {
+								status: code,
+								headers: {
+									"Content-Type": "application/json",
+									...corsHeaders
+								}
+							}));
+						}
+					}),
+					json: (data: any) => {
+						resolve(new Response(JSON.stringify(data), {
+							headers: {
+								"Content-Type": "application/json",
+								...corsHeaders
+							}
+						}));
+					}
+				};
+
+				req.json().then((body: any) => {
+					handleGenerateSignature({ body }, mockRes);
+				}).catch((error: any) => {
+					console.error("Counter signature request failed:", error);
+					resolve(new Response(JSON.stringify({ error: "Invalid request body" }), {
+						status: 400,
+						headers: {
+							"Content-Type": "application/json",
+							...corsHeaders
+						}
+					}));
+				});
+			});
+		}
+
 		// Sync past transfers to populate database
 		if (url.pathname === "/sync") {
 			try {
 				const transferResult = await syncPastTransfers();
 				const purchaseResult = await syncPastPurchases();
+				const resaleResult = await syncPastMarketplaceTransfers();
 				
-				const totalEvents = transferResult.eventsProcessed + purchaseResult.eventsProcessed;
+				const totalEvents = transferResult.eventsProcessed + purchaseResult.eventsProcessed + resaleResult.eventsProcessed;
 				
 				return new Response(JSON.stringify({
 					success: true,
 					eventsProcessed: totalEvents,
 					transferEvents: transferResult.eventsProcessed,
-					purchaseEvents: purchaseResult.eventsProcessed
+					purchaseEvents: purchaseResult.eventsProcessed,
+					resaleEvents: resaleResult.eventsProcessed
 				}), {
 					headers: {
 						"Content-Type": "application/json",
@@ -987,6 +1180,24 @@ serve({
 			}
 		}
 
+		// Debug current listing row for a token
+		if (url.pathname === "/debug-listing" && req.method === "GET") {
+			try {
+				const tokenId = url.searchParams.get("tokenId");
+				const contractAddress = url.searchParams.get("contractAddress") || CROWN_NFT_ADDRESS;
+				if (!tokenId) {
+					return new Response(JSON.stringify({ error: "Missing tokenId" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+				}
+				const row = await client.execute({
+					sql: `SELECT * FROM listings WHERE token_id = ? AND contract_address = ? ORDER BY created_at DESC LIMIT 1`,
+					args: [tokenId.toString(), contractAddress]
+				});
+				return new Response(JSON.stringify({ listing: row.rows?.[0] || null }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+			} catch (e) {
+				return new Response(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+			}
+		}
+
 		// Get contract info endpoint
 		if (url.pathname === "/contract-info") {
 			return new Response(JSON.stringify({
@@ -1012,13 +1223,14 @@ serve({
 // Run initial sync when server starts
 console.log("🚀 Crown NFT Server starting...");
 console.log("📋 Contract Addresses:");
-      console.log("  - CrownNFT V5 (Fixed):", CROWN_NFT_ADDRESS);
-  console.log("  - CrownPurchase V5 (Fixed):", CROWN_PURCHASE_ADDRESS);
+console.log("  - CrownNFT V8:", CROWN_NFT_ADDRESS);
+console.log("  - CrownPurchase V8:", CROWN_PURCHASE_ADDRESS);
 console.log("  - DarkToken:", DARK_TOKEN_ADDRESS);
 
 try {
 	await syncPastTransfers();
 	await syncPastPurchases();
+	await syncPastMarketplaceTransfers();
 	console.log("✅ Initial sync completed");
 } catch (error) {
 	console.error("❌ Initial sync failed:", error);

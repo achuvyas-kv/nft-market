@@ -1,6 +1,6 @@
 import { ethers } from "hardhat";
 
-const DARK_TOKEN_ADDRESS = "0x9740D146D20FCF8643274cCD4Db91210200c9ed4";
+const DARK_TOKEN_ADDRESS = "0x4d4C324C3a408476e25887025dDbA50839ECd7B1";
 
 async function main() {
     // Get recipient address from environment variables or use default
